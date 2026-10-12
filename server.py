@@ -66,11 +66,11 @@ def duration_of(path):
 
 def make_image(prompt, size, path, seed):
     w, h = size
-    url = ("https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt[:900]) +
-           f"?width={w}&height={h}&nologo=true&seed={seed}")
-    for attempt in range(3):
+    for attempt in range(5):
+        url = ("https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt[:400]) +
+               f"?width={w}&height={h}&nologo=true&model=flux&seed={seed + attempt}")
         try:
-            r = requests.get(url, timeout=90)
+            r = requests.get(url, timeout=60)
             if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
                 with open(path, "wb") as f:
                     f.write(r.content)
@@ -78,7 +78,7 @@ def make_image(prompt, size, path, seed):
                 return "ai"
         except Exception:
             pass
-        time.sleep(4 * (attempt + 1))
+        time.sleep(3 * (attempt + 1))
     img = Image.new("RGB", size, (20, 30, 60))
     d = ImageDraw.Draw(img)
     for y in range(h):
