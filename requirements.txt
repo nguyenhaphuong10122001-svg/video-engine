@@ -3,3 +3,4 @@ uvicorn[standard]==0.34.0
 requests==2.32.3
 gTTS==2.5.4
 Pillow==11.1.0
+edge-tts
