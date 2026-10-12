@@ -27,6 +27,7 @@ class Scene(BaseModel):
     narration: str = Field(min_length=4, max_length=1200)
     caption: str = Field(min_length=1, max_length=140)
     seconds: int = Field(ge=4, le=25)
+    search_query: str | None = Field(default=None, max_length=120)
 
 
 class RenderRequest(BaseModel):
@@ -64,8 +65,44 @@ def duration_of(path):
     return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
 
 
-def make_image(prompt, size, path, seed):
+UA = {"User-Agent": "VideoEngine/2.0 (n8n workflow video generator)"}
+
+
+def commons_image(query, size, path, seed):
+    if not query:
+        return False
+    try:
+        r = requests.get("https://commons.wikimedia.org/w/api.php", headers=UA, timeout=30, params={
+            "action": "query", "format": "json", "generator": "search", "gsrnamespace": 6,
+            "gsrsearch": query + " filetype:bitmap", "gsrlimit": 20, "prop": "imageinfo",
+            "iiprop": "url|size|mime", "iiurlwidth": 1600})
+        pages = r.json().get("query", {}).get("pages", {}).values() if r.status_code == 200 else []
+        cands = []
+        for p in pages:
+            ii = (p.get("imageinfo") or [{}])[0]
+            if ii.get("mime") == "image/jpeg" and ii.get("width", 0) >= 1200 and ii.get("thumburl"):
+                cands.append((p.get("index", 99), ii["thumburl"]))
+        cands.sort()
+        for _, url in cands[:4]:
+            img = requests.get(url, headers=UA, timeout=60)
+            if img.status_code != 200:
+                continue
+            with open(path, "wb") as f:
+                f.write(img.content)
+            try:
+                Image.open(path).verify()
+                return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+def make_image(prompt, size, path, seed, query=None):
     w, h = size
+    if commons_image(query, size, path, seed):
+        return "commons"
     for attempt in range(5):
         url = ("https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt[:400]) +
                f"?width={w}&height={h}&nologo=true&model=flux&seed={seed + attempt}")
@@ -107,12 +144,28 @@ def burn_caption(path, text, size):
     im.save(path, "JPEG", quality=90)
 
 
+EDGE_VOICES = {"ru": "ru-RU-DmitryNeural", "vi": "vi-VN-NamMinhNeural", "en": "en-US-AndrewNeural"}
+
+
+def edge_voice(text, lang, path):
+    import asyncio, edge_tts
+    voice = os.environ.get("EDGE_VOICE") or EDGE_VOICES.get(lang, "en-US-AndrewNeural")
+    asyncio.run(edge_tts.Communicate(text, voice, rate="+0%").save(path))
+    if os.path.getsize(path) < 1000:
+        raise RuntimeError("empty edge audio")
+
+
 def make_voice(text, lang, path):
+    try:
+        edge_voice(text, lang, path)
+        return "edge"
+    except Exception:
+        pass
     last = None
     for attempt in range(3):
         try:
             gTTS(text=text, lang=lang if lang in ("ru", "vi", "en") else "en").save(path)
-            return
+            return "gtts"
         except Exception as e:
             last = e
             time.sleep(3)
@@ -130,14 +183,17 @@ def render(job_id, req: RenderRequest):
         clips = []
         total = len(req.scenes)
         notes = []
+        voices = []
         for i, s in enumerate(req.scenes):
             job["progress"] = f"scene {i + 1}/{total}"
             img, mp3 = f"{work}/s{i}.jpg", f"{work}/s{i}.mp3"
-            notes.append(make_image(s.visual_prompt, size, img, seed=i + 7))
-            make_voice(s.narration, req.language, mp3)
+            notes.append(make_image(s.visual_prompt, size, img, seed=i + 7, query=s.search_query))
+            voices.append(make_voice(s.narration, req.language, mp3))
             dur = max(float(s.seconds), duration_of(mp3) + 0.4)
             burn_caption(img, s.caption, size)
-            vf = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},format=yuv420p"
+            frames = int(dur * 25) + 5
+            vf = (f"scale={w*2}:{h*2}:force_original_aspect_ratio=increase,crop={w*2}:{h*2},"
+                  f"zoompan=z='min(zoom+0.0007,1.25)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={w}x{h}:fps=25,format=yuv420p")
             out = f"{work}/clip{i}.mp4"
             run([FFMPEG, "-y", "-loop", "1", "-framerate", "25", "-i", img, "-i", mp3,
                  "-t", f"{dur:.2f}", "-vf", vf, "-af", "apad,aresample=44100", "-ac", "2",
@@ -155,6 +211,7 @@ def render(job_id, req: RenderRequest):
         job["duration"] = round(duration_of(final), 1)
         job["video_url"] = f"{base_url()}/videos/{job_id}/video.mp4"
         job["image_source"] = notes
+        job["voice"] = voices
         job["status"] = "succeeded"
         job["progress"] = "done"
         for fn in os.listdir(work):
